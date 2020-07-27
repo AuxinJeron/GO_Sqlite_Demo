@@ -49,6 +49,7 @@ const (
 const (
 	PREPARE_STATEMENT_SUCCESS PrepareStatementResult = iota
 	PREPARE_STATEMENT_UNRECOGNIZED
+	PREPARE_STRING_TOO_LONG
 	PREPARE_SYNTAX_ERROR
 )
 
@@ -93,12 +94,21 @@ func main() {
 		case (PREPARE_SYNTAX_ERROR):
 			fmt.Printf("Syntax error. Could not parse statement.\n")
 			continue
+		case (PREPARE_STRING_TOO_LONG):
+			fmt.Printf("String is too long.\n")
+			continue
 		case (PREPARE_STATEMENT_UNRECOGNIZED):
 			fmt.Printf("Unrecognized command '%s'.\n", command)
 			continue
 		}
-		execute_statement(&statement, &table)
-		fmt.Println("Executed.")
+
+		switch execute_statement(&statement, &table) {
+		case (EXECUTE_SUCCESS):
+			fmt.Println("Executed.")
+			break
+		case (EXECUTE_TABLE_FULL):
+			fmt.Println("Error: Table full.")
+		}
 	}
 }
 
@@ -123,6 +133,12 @@ func prepare_statement(cmdStr string, statement *Statement) PrepareStatementResu
 		args, _ := fmt.Sscanf(cmdStr, "insert %d %s %s", &statement.rowToInsert.id, &statement.rowToInsert.username, &statement.rowToInsert.email)
 		if args < 3 {
 			return PREPARE_SYNTAX_ERROR
+		}
+		if len(statement.rowToInsert.username) > USER_NAME_SIZE {
+			return PREPARE_STRING_TOO_LONG
+		}
+		if len(statement.rowToInsert.email) > EMAIL_SIZE {
+			return PREPARE_STRING_TOO_LONG
 		}
 		return PREPARE_STATEMENT_SUCCESS
 	}
