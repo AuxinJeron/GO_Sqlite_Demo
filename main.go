@@ -37,9 +37,15 @@ type Row struct {
 	email    string
 }
 
+type Pager struct {
+	fileDescriptor *os.File
+	fileLength     int64
+	pages          [][]byte
+}
+
 type Table struct {
-	numrows uint32
-	pages   [][]byte
+	numrows int64
+	pager   *Pager
 }
 
 const (
@@ -65,7 +71,14 @@ const (
 )
 
 func main() {
-	table := new_table()
+
+	if len(os.Args) < 2 {
+		fmt.Printf("Must supply a database filename.\n")
+		os.Exit(1)
+	}
+
+	filename := os.Args[1]
+	table := db_open(filename)
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Simple SQLite")
@@ -78,7 +91,7 @@ func main() {
 		command = strings.Replace(command, "\n", "", -1)
 
 		if command[0] == '.' {
-			switch do_meta_command(command) {
+			switch do_meta_command(command, table) {
 			case (META_COMMAND_SUCCESS):
 				continue
 			case (META_COMMAND_UNRECOGNIZED):
@@ -102,7 +115,7 @@ func main() {
 			continue
 		}
 
-		switch execute_statement(&statement, &table) {
+		switch execute_statement(&statement, table) {
 		case (EXECUTE_SUCCESS):
 			fmt.Println("Executed.")
 			break
@@ -116,8 +129,9 @@ func print_prompt() {
 	fmt.Print("db > ")
 }
 
-func do_meta_command(command string) MetaCommandResult {
+func do_meta_command(command string, table *Table) MetaCommandResult {
 	if strings.Compare(".exit", command) == 0 {
+		db_close(table)
 		os.Exit(0)
 	} else {
 		return META_COMMAND_UNRECOGNIZED
@@ -177,13 +191,9 @@ func deserialize_row(src []byte) Row {
 	return dst
 }
 
-func row_slot(table *Table, rownum uint32) []byte {
+func row_slot(table *Table, rownum int64) []byte {
 	pagenum := rownum / ROWS_PER_PAGE
-	page := table.pages[pagenum]
-	if page == nil {
-		table.pages[pagenum] = make([]byte, PAGE_SIZE)
-		page = table.pages[pagenum]
-	}
+	page := get_page(table.pager, pagenum)
 	rowOffset := rownum % ROWS_PER_PAGE
 	byteOffset := rowOffset * ROW_SIZE
 	return page[byteOffset : byteOffset+ROW_SIZE+1]
@@ -199,7 +209,7 @@ func execute_insert(statement *Statement, table *Table) ExecuteResult {
 }
 
 func execute_select(statement *Statement, table *Table) ExecuteResult {
-	var i uint32
+	var i int64
 	for i = 0; i < table.numrows; i++ {
 		row := deserialize_row(row_slot(table, i))
 		fmt.Println(row)
@@ -207,9 +217,102 @@ func execute_select(statement *Statement, table *Table) ExecuteResult {
 	return EXECUTE_SUCCESS
 }
 
-func new_table() Table {
-	var table Table
-	table.numrows = 0
-	table.pages = make([][]byte, TABLE_MAX_PAGES)
+func db_open(filename string) *Table {
+	pager := pager_open(filename)
+	table := new(Table)
+	table.pager = pager
+	table.numrows = pager.fileLength / ROW_SIZE
 	return table
+}
+
+func db_close(table *Table) {
+	pager := table.pager
+	numFullPages := table.numrows / ROWS_PER_PAGE
+
+	for i := int64(0); i < numFullPages; i++ {
+		if pager.pages[i] == nil {
+			continue
+		}
+		pager_flush(pager, i, PAGE_SIZE)
+		pager.pages[i] = nil
+	}
+
+	numAdditionalRows := table.numrows % ROWS_PER_PAGE
+	if numAdditionalRows > 0 {
+		if pager.pages[numFullPages] != nil {
+			pager_flush(pager, numFullPages, numAdditionalRows*ROW_SIZE)
+			pager.pages[numFullPages] = nil
+		}
+	}
+
+	pager_close(pager)
+}
+
+func pager_open(filename string) *Pager {
+	// Read the persistent file
+	fd, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0755)
+	if err != nil {
+		fmt.Printf("Unable to open file.\n")
+		os.Exit(1)
+	}
+	offset, err := fd.Seek(0, 2)
+	// Init the pager based on the persistent file
+	pager := new(Pager)
+	pager.fileDescriptor = fd
+	pager.fileLength = offset
+	pager.pages = make([][]byte, TABLE_MAX_PAGES)
+
+	return pager
+}
+
+func pager_close(pager *Pager) {
+	if err := pager.fileDescriptor.Close(); err != nil {
+		fmt.Printf("Error closing db file. %v.\n", err)
+		os.Exit(1)
+	}
+}
+
+func get_page(pager *Pager, pagenum int64) []byte {
+	if pagenum > TABLE_MAX_PAGES {
+		fmt.Printf("Tried to fetch page number out of bounds. %d > %d\n", pagenum, TABLE_MAX_PAGES)
+	}
+
+	if pager.pages[pagenum] == nil {
+		// Cache miss. Allocate memory and load from file
+		pager.pages[pagenum] = make([]byte, PAGE_SIZE)
+		totalpages := pager.fileLength / PAGE_SIZE
+		if pager.fileLength%PAGE_SIZE != 0 {
+			totalpages += 1
+		}
+
+		// Load the bytes to page if the page num exists in the persistent file
+		if pagenum < totalpages {
+			pager.fileDescriptor.Seek(PAGE_SIZE*pagenum, 0)
+			_, err := pager.fileDescriptor.Read(pager.pages[pagenum])
+			if err != nil {
+				fmt.Printf("Error reading file. %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	return pager.pages[pagenum]
+}
+
+func pager_flush(pager *Pager, pagenum int64, size int64) {
+	if pager.pages[pagenum] == nil {
+		fmt.Printf("Tried to flush null page.\n")
+		os.Exit(1)
+	}
+
+	_, err := pager.fileDescriptor.Seek(pagenum*PAGE_SIZE, 0)
+	if err != nil {
+		fmt.Printf("Error seeking. %v\n", err)
+		os.Exit(-1)
+	}
+
+	_, err = pager.fileDescriptor.Write(pager.pages[pagenum][0:size])
+	if err != nil {
+		fmt.Printf("Error writing. %v\n", err)
+	}
 }
