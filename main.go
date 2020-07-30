@@ -48,6 +48,12 @@ type Table struct {
 	pager   *Pager
 }
 
+type Cursor struct {
+	table      *Table
+	rowNum     int64
+	endOfTable bool // indicates a position one past the last element
+}
+
 const (
 	META_COMMAND_SUCCESS MetaCommandResult = iota
 	META_COMMAND_UNRECOGNIZED
@@ -191,10 +197,10 @@ func deserialize_row(src []byte) Row {
 	return dst
 }
 
-func row_slot(table *Table, rownum int64) []byte {
-	pagenum := rownum / ROWS_PER_PAGE
-	page := get_page(table.pager, pagenum)
-	rowOffset := rownum % ROWS_PER_PAGE
+func cursor_value(cursor *Cursor) []byte {
+	pagenum := cursor.rowNum / ROWS_PER_PAGE
+	page := get_page(cursor.table.pager, pagenum)
+	rowOffset := cursor.rowNum % ROWS_PER_PAGE
 	byteOffset := rowOffset * ROW_SIZE
 	return page[byteOffset : byteOffset+ROW_SIZE+1]
 }
@@ -203,16 +209,19 @@ func execute_insert(statement *Statement, table *Table) ExecuteResult {
 	if table.numrows >= TABLE_MAX_ROWS {
 		return EXECUTE_TABLE_FULL
 	}
-	copy(row_slot(table, table.numrows), serialize_row(statement.rowToInsert))
+	cursor := table_end(table)
+	copy(cursor_value(cursor), serialize_row(statement.rowToInsert))
 	table.numrows += 1
 	return EXECUTE_SUCCESS
 }
 
 func execute_select(statement *Statement, table *Table) ExecuteResult {
-	var i int64
-	for i = 0; i < table.numrows; i++ {
-		row := deserialize_row(row_slot(table, i))
+	cursor := table_start(table)
+
+	for !cursor.endOfTable {
+		row := deserialize_row(cursor_value(cursor))
 		fmt.Println(row)
+		cursor_advance(cursor)
 	}
 	return EXECUTE_SUCCESS
 }
@@ -315,4 +324,25 @@ func pager_flush(pager *Pager, pagenum int64, size int64) {
 	if err != nil {
 		fmt.Printf("Error writing. %v\n", err)
 	}
+}
+
+func table_start(table *Table) *Cursor {
+	cursor := new(Cursor)
+	cursor.table = table
+	cursor.rowNum = 0
+	cursor.endOfTable = (table.numrows == 0)
+	return cursor
+}
+
+func table_end(table *Table) *Cursor {
+	cursor := new(Cursor)
+	cursor.table = table
+	cursor.rowNum = table.numrows
+	cursor.endOfTable = true
+	return cursor
+}
+
+func cursor_advance(cursor *Cursor) {
+	cursor.rowNum += 1
+	cursor.endOfTable = (cursor.rowNum >= cursor.table.numrows)
 }
