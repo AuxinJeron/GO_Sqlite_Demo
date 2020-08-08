@@ -106,6 +106,7 @@ const (
 	EXECUTE_SUCCESS ExecuteResult = iota
 	EXECUTE_TABLE_FULL
 	EXECUTE_FAILURE
+	EXECUTE_DUPLICATE_KEY
 )
 
 const (
@@ -163,8 +164,12 @@ func main() {
 		case (EXECUTE_SUCCESS):
 			fmt.Println("Executed.")
 			break
+		case (EXECUTE_DUPLICATE_KEY):
+			fmt.Printf("Error: Duplicate key.\n")
+			break
 		case (EXECUTE_TABLE_FULL):
 			fmt.Println("Error: Table full.")
+			break
 		}
 	}
 }
@@ -269,10 +274,20 @@ func cursor_value(cursor *Cursor) []byte {
 
 func execute_insert(statement *Statement, table *Table) ExecuteResult {
 	node := get_page(table.pager, table.rootPageNum)
-	if *leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS {
+	numCells := *leaf_node_num_cells(node)
+	if numCells >= LEAF_NODE_MAX_CELLS {
 		return EXECUTE_TABLE_FULL
 	}
-	cursor := table_end(table)
+	keyToInsert := statement.rowToInsert.id
+	cursor := table_find(table, keyToInsert)
+
+	if cursor.cellNum < numCells {
+		// check whether the key exists
+		keyAtIndex := *leaf_node_cell_key(node, cursor.cellNum)
+		if keyAtIndex == keyToInsert {
+			return EXECUTE_DUPLICATE_KEY
+		}
+	}
 	leaf_node_insert(cursor, statement.rowToInsert.id, statement.rowToInsert)
 	return EXECUTE_SUCCESS
 }
@@ -406,16 +421,20 @@ func table_start(table *Table) *Cursor {
 	return cursor
 }
 
-func table_end(table *Table) *Cursor {
-	cursor := new(Cursor)
-	cursor.table = table
-	cursor.pageNum = table.rootPageNum
-
-	rootNode := get_page(table.pager, table.rootPageNum)
-	numCells := leaf_node_num_cells(rootNode)
-	cursor.cellNum = *numCells
-	cursor.endOfTable = true
-	return cursor
+/*
+Return the position of the given key.
+If the key is not present, return the position where it should be inserted
+*/
+func table_find(table *Table, key uint32) *Cursor {
+	rootPageNum := table.rootPageNum
+	rootNode := get_page(table.pager, rootPageNum)
+	if get_node_type(rootNode) == NODE_LEAF {
+		return leaf_node_find(table, rootPageNum, key)
+	} else {
+		fmt.Printf("Need to implement searching an internal node\n")
+		os.Exit(1)
+	}
+	return nil
 }
 
 func cursor_advance(cursor *Cursor) {
@@ -424,6 +443,15 @@ func cursor_advance(cursor *Cursor) {
 	cursor.cellNum += 1
 	// Why it is end of table if the cell num is greater than num cells
 	cursor.endOfTable = (cursor.cellNum >= *leaf_node_num_cells(node))
+}
+
+func get_node_type(node []byte) NodeType {
+	value := node[NODE_TYPE_OFFSET]
+	return NodeType(value)
+}
+
+func set_node_type(node []byte, nodeType NodeType) {
+	node[NODE_TYPE_OFFSET] = byte(nodeType)
 }
 
 func leaf_node_num_cells(node []byte) *uint32 {
@@ -444,7 +472,8 @@ func leaf_node_cell_value(node []byte, cellNum uint32) []byte {
 }
 
 func initialize_leaf_node(node []byte) {
-	node[0] = 0
+	set_node_type(node, NODE_LEAF)
+	*leaf_node_num_cells(node) = 0
 }
 
 func leaf_node_insert(cursor *Cursor, key uint32, row *Row) {
@@ -466,4 +495,33 @@ func leaf_node_insert(cursor *Cursor, key uint32, row *Row) {
 	*leaf_node_num_cells(node) += 1
 	*leaf_node_cell_key(node, cursor.cellNum) = key
 	copy(leaf_node_cell_value(node, cursor.cellNum), serialize_row(row))
+}
+
+func leaf_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
+	node := get_page(table.pager, pageNum)
+	numCells := *leaf_node_num_cells(node)
+
+	cursor := &Cursor{}
+	cursor.table = table
+	cursor.pageNum = pageNum
+
+	// binary search
+	minIndex := uint32(0)
+	onePastMaxIndex := numCells
+	for onePastMaxIndex != minIndex {
+		index := (minIndex + onePastMaxIndex) / 2
+		keyAtIndex := *leaf_node_cell_key(node, index)
+		if key == keyAtIndex {
+			cursor.cellNum = index
+			return cursor
+		}
+		if key < keyAtIndex {
+			onePastMaxIndex = index
+		} else {
+			minIndex = index + 1
+		}
+	}
+
+	cursor.cellNum = minIndex
+	return cursor
 }
