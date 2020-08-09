@@ -49,6 +49,24 @@ const LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE
 const LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
 const LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE
 const LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE
+const LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2
+const LEAF_NODE_LEFT_SPLIT_COUNT = LEAF_NODE_MAX_CELLS + 1 - LEAF_NODE_RIGHT_SPLIT_COUNT
+
+/*
+ * Internal Node Header Layout
+ */
+const INTERNAL_NODE_NUM_KEYS_SIZE = 4
+const INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE
+const INTERNAL_NODE_RIGHT_CHILD_SIZE = 4 // Store the rightmore child page number
+const INTERNAL_NODE_RIGHT_CHILD_OFFSET = INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE
+const INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KEYS_SIZE + INTERNAL_NODE_RIGHT_CHILD_SIZE
+
+/*
+ * Internal Node Body Layout
+ */
+const INTENRAL_NODE_KEY_SIZE = 4   // Store key id
+const INTENRAL_NODE_CHILD_SIZE = 4 // Store child page number
+const INTERNAL_NODE_CELL_SIZE = INTENRAL_NODE_KEY_SIZE + INTENRAL_NODE_CHILD_SIZE
 
 type MetaCommandResult int32
 type PrepareStatementResult int32
@@ -187,12 +205,39 @@ func print_constants() {
 	fmt.Printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS)
 }
 
-func print_leaf_node(node []byte) {
-	numCells := *leaf_node_num_cells(node)
-	fmt.Printf("leaf (size %d)\n", numCells)
-	for i := uint32(0); i < numCells; i++ {
-		key := *leaf_node_cell_key(node, i)
-		fmt.Printf("  - %d : %d\n", i, key)
+func indent(level uint32) {
+	for i := uint32(0); i < level; i++ {
+		fmt.Printf("  ")
+	}
+}
+
+func print_tree(pager *Pager, pageNum uint32, indentationLevel uint32) {
+	node := get_page(pager, pageNum)
+
+	switch get_node_type(node) {
+	case NODE_LEAF:
+		numKeys := *leaf_node_num_cells(node)
+		indent(indentationLevel)
+		fmt.Printf("- leaf (size %d)\n", numKeys)
+		for i := uint32(0); i < numKeys; i++ {
+			indent(indentationLevel + 1)
+
+			fmt.Printf("- %d\n", *leaf_node_cell_key(node, i))
+		}
+		break
+	case NODE_INTERNAL:
+		numKeys := *internal_node_num_keys(node)
+		indent(indentationLevel)
+		fmt.Printf("- internal (size %d)\n", numKeys)
+		for i := uint32(0); i < numKeys; i++ {
+			child := *internal_node_child(node, i)
+			print_tree(pager, child, indentationLevel+1)
+			indent(indentationLevel + 1)
+			fmt.Printf("- key %d\n", *internal_node_cell_key(node, i))
+		}
+		child := *internal_node_right_child(node)
+		print_tree(pager, child, indentationLevel+1)
+		break
 	}
 }
 
@@ -202,7 +247,7 @@ func do_meta_command(command string, table *Table) MetaCommandResult {
 		os.Exit(0)
 	} else if strings.Compare(".btree", command) == 0 {
 		fmt.Printf("Tree:\n")
-		print_leaf_node(get_page(table.pager, 0))
+		print_tree(table.pager, 0, 0)
 		return META_COMMAND_SUCCESS
 	} else if strings.Compare(".constants", command) == 0 {
 		fmt.Printf("Constants:\n")
@@ -275,9 +320,7 @@ func cursor_value(cursor *Cursor) []byte {
 func execute_insert(statement *Statement, table *Table) ExecuteResult {
 	node := get_page(table.pager, table.rootPageNum)
 	numCells := *leaf_node_num_cells(node)
-	if numCells >= LEAF_NODE_MAX_CELLS {
-		return EXECUTE_TABLE_FULL
-	}
+
 	keyToInsert := statement.rowToInsert.id
 	cursor := table_find(table, keyToInsert)
 
@@ -312,6 +355,7 @@ func db_open(filename string) *Table {
 		// New database file. Initial page 0 as leaf node
 		rootNode := get_page(pager, 0)
 		initialize_leaf_node(rootNode)
+		set_node_root(rootNode, true)
 	}
 	return table
 }
@@ -389,6 +433,10 @@ func get_page(pager *Pager, pagenum uint32) []byte {
 	}
 
 	return pager.pages[pagenum]
+}
+
+func get_unused_page_num(pager *Pager) uint32 {
+	return pager.numPages
 }
 
 func pager_flush(pager *Pager, pagenum uint32) {
@@ -473,7 +521,14 @@ func leaf_node_cell_value(node []byte, cellNum uint32) []byte {
 
 func initialize_leaf_node(node []byte) {
 	set_node_type(node, NODE_LEAF)
+	set_node_root(node, false)
 	*leaf_node_num_cells(node) = 0
+}
+
+func initialize_internal_node(node []byte) {
+	set_node_type(node, NODE_INTERNAL)
+	set_node_root(node, false)
+	*internal_node_num_keys(node) = 0
 }
 
 func leaf_node_insert(cursor *Cursor, key uint32, row *Row) {
@@ -481,8 +536,8 @@ func leaf_node_insert(cursor *Cursor, key uint32, row *Row) {
 	numCells := *leaf_node_num_cells(node)
 
 	if numCells >= LEAF_NODE_MAX_CELLS {
-		fmt.Printf("Need to implement spliting a leaf node. \n")
-		os.Exit(1)
+		leaf_node_split_and_insert(cursor, row)
+		return
 	}
 
 	if cursor.cellNum < numCells {
@@ -524,4 +579,142 @@ func leaf_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
 
 	cursor.cellNum = minIndex
 	return cursor
+}
+
+func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
+	/*
+		Create a new node and move half the cells over.
+		Insert the new value in one of the two nodes.
+		Update parent or create a new parent
+	*/
+	oldNode := get_page(cursor.table.pager, cursor.pageNum)
+	newPageNum := get_unused_page_num(cursor.table.pager)
+	newNode := get_page(cursor.table.pager, newPageNum)
+	initialize_leaf_node(newNode)
+
+	/*
+		All existing keys plus new key should be divided
+		evenly between old (left) and new (right) nodes.
+		Starting from the right, move each key to correct position.
+	*/
+	for i := int(LEAF_NODE_MAX_CELLS); i >= 0; i-- {
+		var destNode []byte
+		if i >= LEAF_NODE_LEFT_SPLIT_COUNT {
+			destNode = newNode
+		} else {
+			destNode = oldNode
+		}
+		destCellIndex := uint32(i % LEAF_NODE_LEFT_SPLIT_COUNT)
+		destCell := leaf_node_cell(destNode, destCellIndex)
+
+		if i == int(cursor.cellNum) {
+			copy(destCell, serialize_row(value))
+		} else if i > int(cursor.cellNum) {
+			copy(destCell, leaf_node_cell(oldNode, uint32(i-1)))
+		} else {
+			copy(destCell, leaf_node_cell(oldNode, uint32(i)))
+		}
+	}
+
+	/* Update cell count on both leaf nodes */
+	*leaf_node_num_cells(oldNode) = LEAF_NODE_LEFT_SPLIT_COUNT
+	*leaf_node_num_cells(newNode) = LEAF_NODE_RIGHT_SPLIT_COUNT
+
+	if is_node_root(oldNode) {
+		create_new_root(cursor.table, newPageNum)
+	} else {
+		fmt.Printf("Need to implement updaing parent after split\n")
+		os.Exit(1)
+	}
+}
+
+func create_new_root(table *Table, rightChildPageNum uint32) {
+	/*
+		Handling splitting the root.
+		Old root copied to new page, becomes left child.
+		Address of right child passed in.
+		Re-initialize root page to contain the new root node.
+		New root node points to two children.
+	*/
+	root := get_page(table.pager, table.rootPageNum)
+	leftChildPageNum := get_unused_page_num(table.pager)
+	leftChildPage := get_page(table.pager, leftChildPageNum)
+
+	/* Left child has data copied from old root */
+	copy(leftChildPage, root)
+	set_node_root(leftChildPage, false)
+
+	/* Root node is a new internal node with one key and two children */
+	initialize_internal_node(root)
+	set_node_root(root, true)
+	*internal_node_num_keys(root) = 1
+	*internal_node_child(root, 0) = leftChildPageNum
+	leftChildMaxKey := get_node_max_key(leftChildPage)
+	*internal_node_cell_key(root, 0) = leftChildMaxKey
+	*internal_node_right_child(root) = rightChildPageNum
+}
+
+func internal_node_num_keys(node []byte) *uint32 {
+	return (*uint32)(unsafe.Pointer(&node[INTERNAL_NODE_NUM_KEYS_OFFSET]))
+}
+
+/*
+ * Return the page num of the right most child
+ */
+func internal_node_right_child(node []byte) *uint32 {
+	return (*uint32)(unsafe.Pointer(&node[INTERNAL_NODE_RIGHT_CHILD_OFFSET]))
+}
+
+/*
+ * Return the page num based on the cell num
+ */
+func internal_node_cell_value(node []byte, cellNum uint32) *uint32 {
+	return (*uint32)(unsafe.Pointer(&node[INTERNAL_NODE_HEADER_SIZE+cellNum*INTERNAL_NODE_CELL_SIZE]))
+}
+
+/*
+ * Return the page num based on the chlid num
+ */
+func internal_node_child(node []byte, childNum uint32) *uint32 {
+	numKeys := *internal_node_num_keys(node)
+	if childNum > numKeys {
+		fmt.Printf("Tried to access childNum %d > numKeys %d\n", childNum, numKeys)
+		os.Exit(1)
+	} else if childNum == numKeys {
+		return internal_node_right_child(node)
+	} else {
+		return internal_node_cell_value(node, childNum)
+	}
+	return nil
+}
+
+func internal_node_cell_key(node []byte, keyNum uint32) *uint32 {
+	offset := INTERNAL_NODE_HEADER_SIZE + keyNum*INTERNAL_NODE_CELL_SIZE + INTENRAL_NODE_CHILD_SIZE
+	return (*uint32)(unsafe.Pointer(&node[offset]))
+}
+
+func get_node_max_key(node []byte) uint32 {
+	switch get_node_type(node) {
+	case (NODE_INTERNAL):
+		return *internal_node_cell_key(node, *internal_node_num_keys(node)-1)
+	case (NODE_LEAF):
+		return *leaf_node_cell_key(node, *leaf_node_num_cells(node)-1)
+	default:
+		fmt.Printf("The node type isn't supported\n")
+		os.Exit(1)
+		return 0
+	}
+}
+
+func is_node_root(node []byte) bool {
+	value := uint32(node[IS_ROOT_OFFSET])
+	return value != 0
+}
+
+func set_node_root(node []byte, isRoot bool) {
+	if isRoot {
+		node[IS_ROOT_OFFSET] = byte(1)
+	} else {
+		node[IS_ROOT_OFFSET] = byte(0)
+	}
 }
