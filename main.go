@@ -37,7 +37,9 @@ const COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_S
  */
 const LEAF_NODE_NUM_CELLS_SIZE = 4
 const LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE
-const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+const LEAF_NODE_NEXT_LEAF_SIZE = 4
+const LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE
+const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_SIZE
 
 /*
  * Leaf Node Body Layout
@@ -458,14 +460,12 @@ func pager_flush(pager *Pager, pagenum uint32) {
 }
 
 func table_start(table *Table) *Cursor {
-	cursor := new(Cursor)
-	cursor.table = table
-	cursor.pageNum = table.rootPageNum
-	cursor.cellNum = 0
+	cursor := table_find(table, 0)
 
-	rootNode := get_page(table.pager, table.rootPageNum)
-	numCells := leaf_node_num_cells(rootNode)
-	cursor.endOfTable = (*numCells == 0)
+	node := get_page(table.pager, cursor.pageNum)
+	numCells := *leaf_node_num_cells(node)
+	cursor.endOfTable = (numCells == 0)
+
 	return cursor
 }
 
@@ -479,18 +479,26 @@ func table_find(table *Table, key uint32) *Cursor {
 	if get_node_type(rootNode) == NODE_LEAF {
 		return leaf_node_find(table, rootPageNum, key)
 	} else {
-		fmt.Printf("Need to implement searching an internal node\n")
-		os.Exit(1)
+		return internal_node_find(table, rootPageNum, key)
 	}
-	return nil
 }
 
 func cursor_advance(cursor *Cursor) {
 	pageNum := cursor.pageNum
 	node := get_page(cursor.table.pager, pageNum)
 	cursor.cellNum += 1
-	// Why it is end of table if the cell num is greater than num cells
-	cursor.endOfTable = (cursor.cellNum >= *leaf_node_num_cells(node))
+
+	/* Advance to next leaf node */
+	if cursor.cellNum >= *leaf_node_num_cells(node) {
+		nextPageNum := *leaf_node_next_leaf(node)
+		if nextPageNum == 0 {
+			// This was rightmost leaf
+			cursor.endOfTable = true
+		} else {
+			cursor.pageNum = nextPageNum
+			cursor.cellNum = 0
+		}
+	}
 }
 
 func get_node_type(node []byte) NodeType {
@@ -523,6 +531,7 @@ func initialize_leaf_node(node []byte) {
 	set_node_type(node, NODE_LEAF)
 	set_node_root(node, false)
 	*leaf_node_num_cells(node) = 0
+	*leaf_node_next_leaf(node) = 0 // 0 represents no sibling
 }
 
 func initialize_internal_node(node []byte) {
@@ -581,6 +590,35 @@ func leaf_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
 	return cursor
 }
 
+func internal_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
+	node := get_page(table.pager, pageNum)
+	numKeys := *internal_node_num_keys(node)
+
+	/* Binary search to find the index of child to search */
+	minIndex := uint32(0)
+	maxIndex := numKeys
+
+	for minIndex != maxIndex {
+		index := (minIndex + maxIndex) / 2
+		keyToRight := *internal_node_cell_key(node, index)
+		if keyToRight >= key {
+			maxIndex = index
+		} else {
+			minIndex = index + 1
+		}
+	}
+
+	childNum := *internal_node_child(node, minIndex)
+	child := get_page(table.pager, childNum)
+	switch get_node_type(child) {
+	case NODE_LEAF:
+		return leaf_node_find(table, childNum, key)
+	case NODE_INTERNAL:
+		return internal_node_find(table, childNum, key)
+	}
+	return nil
+}
+
 func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
 	/*
 		Create a new node and move half the cells over.
@@ -591,6 +629,8 @@ func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
 	newPageNum := get_unused_page_num(cursor.table.pager)
 	newNode := get_page(cursor.table.pager, newPageNum)
 	initialize_leaf_node(newNode)
+	*leaf_node_next_leaf(newNode) = *leaf_node_next_leaf(oldNode)
+	*leaf_node_next_leaf(oldNode) = newPageNum
 
 	/*
 		All existing keys plus new key should be divided
@@ -608,7 +648,8 @@ func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
 		destCell := leaf_node_cell(destNode, destCellIndex)
 
 		if i == int(cursor.cellNum) {
-			copy(destCell, serialize_row(value))
+			*leaf_node_cell_key(destNode, destCellIndex) = value.id
+			copy(leaf_node_cell_value(destNode, destCellIndex), serialize_row(value))
 		} else if i > int(cursor.cellNum) {
 			copy(destCell, leaf_node_cell(oldNode, uint32(i-1)))
 		} else {
@@ -623,9 +664,12 @@ func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
 	if is_node_root(oldNode) {
 		create_new_root(cursor.table, newPageNum)
 	} else {
-		fmt.Printf("Need to implement updaing parent after split\n")
-		os.Exit(1)
+		fmt.Printf("Need to implement updating parent after split\n")
 	}
+}
+
+func leaf_node_next_leaf(node []byte) *uint32 {
+	return (*uint32)(unsafe.Pointer(&node[LEAF_NODE_NEXT_LEAF_OFFSET]))
 }
 
 func create_new_root(table *Table, rightChildPageNum uint32) {
