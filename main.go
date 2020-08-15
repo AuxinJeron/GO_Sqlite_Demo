@@ -69,6 +69,7 @@ const INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KE
 const INTENRAL_NODE_KEY_SIZE = 4   // Store key id
 const INTENRAL_NODE_CHILD_SIZE = 4 // Store child page number
 const INTERNAL_NODE_CELL_SIZE = INTENRAL_NODE_KEY_SIZE + INTENRAL_NODE_CHILD_SIZE
+const INTERNAL_NODE_MAX_CELLS = 3
 
 type MetaCommandResult int32
 type PrepareStatementResult int32
@@ -590,10 +591,11 @@ func leaf_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
 	return cursor
 }
 
-func internal_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
-	node := get_page(table.pager, pageNum)
+func internal_node_find_child(node []byte, key uint32) uint32 {
+	/*
+	 * Return the index of the child which should contain the given key
+	 */
 	numKeys := *internal_node_num_keys(node)
-
 	/* Binary search to find the index of child to search */
 	minIndex := uint32(0)
 	maxIndex := numKeys
@@ -607,8 +609,14 @@ func internal_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
 			minIndex = index + 1
 		}
 	}
+	return minIndex
+}
 
-	childNum := *internal_node_child(node, minIndex)
+func internal_node_find(table *Table, pageNum uint32, key uint32) *Cursor {
+	node := get_page(table.pager, pageNum)
+
+	childIndex := internal_node_find_child(node, key)
+	childNum := *internal_node_child(node, childIndex)
 	child := get_page(table.pager, childNum)
 	switch get_node_type(child) {
 	case NODE_LEAF:
@@ -626,9 +634,11 @@ func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
 		Update parent or create a new parent
 	*/
 	oldNode := get_page(cursor.table.pager, cursor.pageNum)
+	oldMax := get_node_max_key(oldNode)
 	newPageNum := get_unused_page_num(cursor.table.pager)
 	newNode := get_page(cursor.table.pager, newPageNum)
 	initialize_leaf_node(newNode)
+	*node_parent(newNode) = *node_parent(oldNode)
 	*leaf_node_next_leaf(newNode) = *leaf_node_next_leaf(oldNode)
 	*leaf_node_next_leaf(oldNode) = newPageNum
 
@@ -664,7 +674,11 @@ func leaf_node_split_and_insert(cursor *Cursor, value *Row) {
 	if is_node_root(oldNode) {
 		create_new_root(cursor.table, newPageNum)
 	} else {
-		fmt.Printf("Need to implement updating parent after split\n")
+		parentPageNum := *node_parent(oldNode)
+		newMax := get_node_max_key(oldNode)
+		parent := get_page(cursor.table.pager, parentPageNum)
+		update_internal_node_key(parent, oldMax, newMax)
+		internal_node_insert(cursor.table, parentPageNum, newPageNum)
 	}
 }
 
@@ -732,6 +746,11 @@ func internal_node_child(node []byte, childNum uint32) *uint32 {
 	return nil
 }
 
+func internal_node_cell(node []byte, cellNum uint32) []byte {
+	offset := INTERNAL_NODE_HEADER_SIZE + cellNum*INTERNAL_NODE_CELL_SIZE
+	return node[offset : offset+INTERNAL_NODE_CELL_SIZE]
+}
+
 func internal_node_cell_key(node []byte, keyNum uint32) *uint32 {
 	offset := INTERNAL_NODE_HEADER_SIZE + keyNum*INTERNAL_NODE_CELL_SIZE + INTENRAL_NODE_CHILD_SIZE
 	return (*uint32)(unsafe.Pointer(&node[offset]))
@@ -760,5 +779,52 @@ func set_node_root(node []byte, isRoot bool) {
 		node[IS_ROOT_OFFSET] = byte(1)
 	} else {
 		node[IS_ROOT_OFFSET] = byte(0)
+	}
+}
+
+func node_parent(node []byte) *uint32 {
+	return (*uint32)(unsafe.Pointer(&node[PARENT_POINTER_OFFSET]))
+}
+
+func update_internal_node_key(node []byte, oldKey uint32, newKey uint32) {
+	oldChildIndex := internal_node_find_child(node, oldKey)
+	*internal_node_cell_key(node, oldChildIndex) = newKey
+}
+
+func internal_node_insert(table *Table, parentPageNum uint32, childPageNum uint32) {
+	/*
+	 * Add a new child/key pair to parent that corresponds to child
+	 */
+
+	parent := get_page(table.pager, parentPageNum)
+	child := get_page(table.pager, childPageNum)
+	childMaxKey := get_node_max_key(child)
+	index := internal_node_find_child(parent, childMaxKey)
+
+	originalNumKeys := *internal_node_num_keys(parent)
+	*internal_node_num_keys(parent) = originalNumKeys + 1
+
+	if originalNumKeys >= INTERNAL_NODE_MAX_CELLS {
+		fmt.Printf("Need to implement splitting internal node\n")
+		os.Exit(1)
+	}
+
+	rightChildPageNum := *internal_node_right_child(parent)
+	rightChild := get_page(table.pager, rightChildPageNum)
+
+	if childMaxKey > get_node_max_key(rightChild) {
+		/* Replace the right child */
+		*internal_node_child(parent, originalNumKeys) = rightChildPageNum
+		*internal_node_cell_key(parent, originalNumKeys) = get_node_max_key(rightChild)
+		*internal_node_right_child(parent) = childPageNum
+	} else {
+		/* Make room for the new cell */
+		for i := originalNumKeys; i > index; i-- {
+			dest := internal_node_cell(parent, i)
+			src := internal_node_cell(parent, i-1)
+			copy(dest, src)
+		}
+		*internal_node_child(parent, index) = childPageNum
+		*internal_node_cell_key(parent, index) = childMaxKey
 	}
 }
